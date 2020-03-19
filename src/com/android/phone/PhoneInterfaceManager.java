@@ -55,6 +55,7 @@ import android.os.UserHandle;
 import android.os.UserManager;
 import android.os.WorkSource;
 import android.preference.PreferenceManager;
+import android.provider.DeviceConfig;
 import android.provider.Settings;
 import android.provider.Telephony;
 import android.telecom.PhoneAccount;
@@ -255,6 +256,8 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
     private static final int EVENT_ENABLE_MODEM_DONE = 69;
     private static final int CMD_GET_MODEM_STATUS = 70;
     private static final int EVENT_GET_MODEM_STATUS_DONE = 71;
+    private static final int CMD_ERASE_MODEM_CONFIG = 72;
+    private static final int EVENT_ERASE_MODEM_CONFIG_DONE = 73;
 
     // Parameters of select command.
     private static final int SELECT_COMMAND = 0xA4;
@@ -293,6 +296,12 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
 
     private static final int TYPE_ALLOCATION_CODE_LENGTH = 8;
     private static final int MANUFACTURER_CODE_LENGTH = 8;
+
+    /**
+     * Experiment flag to enable erase modem config on reset network, default value is false
+     */
+    public static final String RESET_NETWORK_ERASE_MODEM_CONFIG_ENABLED =
+            "reset_network_erase_modem_config_enabled";
 
     /**
      * A request object to use for transmitting data to an ICC.
@@ -1162,6 +1171,14 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
                     }
                     notifyRequester(request);
                     break;
+                case CMD_ERASE_MODEM_CONFIG:
+                    request = (MainThreadRequest) msg.obj;
+                    onCompleted = obtainMessage(EVENT_ERASE_MODEM_CONFIG_DONE, request);
+                    defaultPhone.eraseModemConfig(onCompleted);
+                    break;
+                case EVENT_ERASE_MODEM_CONFIG_DONE:
+                    handleNullReturnEvent(msg, "eraseModemConfig");
+                    break;
                 default:
                     Log.w(LOG_TAG, "MainThreadHandler: unexpected message code: " + msg.what);
                     break;
@@ -1368,6 +1385,20 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
     // returns phone associated with the subId.
     private Phone getPhone(int subId) {
         return PhoneFactory.getPhone(mSubscriptionController.getPhoneId(subId));
+    }
+
+    private void sendEraseModemConfig(Phone phone) {
+        if (phone != null) {
+            TelephonyPermissions.enforceCallingOrSelfModifyPermissionOrCarrierPrivilege(
+                  mApp, phone.getSubId(), "eraseModemConfig");
+            final long identity = Binder.clearCallingIdentity();
+            try {
+                Boolean success = (Boolean) sendRequest(CMD_ERASE_MODEM_CONFIG, null);
+                if (DBG) log("eraseModemConfig:" + ' ' + (success ? "ok" : "fail"));
+            } finally {
+                Binder.restoreCallingIdentity(identity);
+            }
+        }
     }
 
     public void dial(String number) {
@@ -2030,14 +2061,18 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
     /**
      * Returns the target SDK version number for a given package name.
      *
+     * This call MUST be invoked before clearing the calling UID.
+     *
      * @return target SDK if the package is found or INT_MAX.
      */
     private int getTargetSdk(String packageName) {
         try {
-            final ApplicationInfo ai = mApp.getPackageManager().getApplicationInfo(
-                            packageName, 0);
+            final ApplicationInfo ai = mApp.getPackageManager().getApplicationInfoAsUser(
+                    packageName, 0, UserHandle.getUserId(Binder.getCallingUid()));
             if (ai != null) return ai.targetSdkVersion;
         } catch (PackageManager.NameNotFoundException unexpected) {
+            loge("Failed to get package info for pkg="
+                    + packageName + ", uid=" + Binder.getCallingUid());
         }
         return Integer.MAX_VALUE;
     }
@@ -4749,6 +4784,52 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
         }
     }
 
+    private int getCarrierPrivilegeStatusFromCarrierConfigRules(int privilegeFromSim,
+            Phone phone) {
+        //load access rules from carrier configs, and check those as well: b/139133814
+        SubscriptionController subController = SubscriptionController.getInstance();
+        if (privilegeFromSim == TelephonyManager.CARRIER_PRIVILEGE_STATUS_HAS_ACCESS
+                || subController == null) return privilegeFromSim;
+
+        int uid = Binder.getCallingUid();
+        PackageManager pkgMgr = phone.getContext().getPackageManager();
+        String[] packages = pkgMgr.getPackagesForUid(uid);
+
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            SubscriptionInfo subInfo = subController.getSubscriptionInfo(phone.getSubId());
+            SubscriptionManager subManager = (SubscriptionManager)
+                    phone.getContext().getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+            for (String pkg : packages) {
+                if (subManager.canManageSubscription(subInfo, pkg)) {
+                    return TelephonyManager.CARRIER_PRIVILEGE_STATUS_HAS_ACCESS;
+                }
+            }
+            return privilegeFromSim;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+    }
+
+    private int getCarrierPrivilegeStatusFromCarrierConfigRules(int privilegeFromSim, Phone phone,
+            String pkgName) {
+        //load access rules from carrier configs, and check those as well: b/139133814
+        SubscriptionController subController = SubscriptionController.getInstance();
+        if (privilegeFromSim == TelephonyManager.CARRIER_PRIVILEGE_STATUS_HAS_ACCESS
+                || subController == null) return privilegeFromSim;
+
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            SubscriptionInfo subInfo = subController.getSubscriptionInfo(phone.getSubId());
+            SubscriptionManager subManager = (SubscriptionManager)
+                    phone.getContext().getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+            return subManager.canManageSubscription(subInfo, pkgName)
+                ? TelephonyManager.CARRIER_PRIVILEGE_STATUS_HAS_ACCESS : privilegeFromSim;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+    }
+
     @Override
     public int getCarrierPrivilegeStatus(int subId) {
         final Phone phone = getPhone(subId);
@@ -4761,8 +4842,10 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
             loge("getCarrierPrivilegeStatus: No UICC");
             return TelephonyManager.CARRIER_PRIVILEGE_STATUS_RULES_NOT_LOADED;
         }
-        return card.getCarrierPrivilegeStatusForCurrentTransaction(
-                phone.getContext().getPackageManager());
+
+        return getCarrierPrivilegeStatusFromCarrierConfigRules(
+            card.getCarrierPrivilegeStatusForCurrentTransaction(
+                phone.getContext().getPackageManager()), phone);
     }
 
     @Override
@@ -4778,7 +4861,9 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
             loge("getCarrierPrivilegeStatus: No UICC");
             return TelephonyManager.CARRIER_PRIVILEGE_STATUS_RULES_NOT_LOADED;
         }
-        return profile.getCarrierPrivilegeStatusForUid(phone.getContext().getPackageManager(), uid);
+        return getCarrierPrivilegeStatusFromCarrierConfigRules(
+            profile.getCarrierPrivilegeStatusForUid(
+                phone.getContext().getPackageManager(), uid), phone);
     }
 
     @Override
@@ -4793,8 +4878,9 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
             loge("checkCarrierPrivilegesForPackage: No UICC on subId " + subId);
             return TelephonyManager.CARRIER_PRIVILEGE_STATUS_RULES_NOT_LOADED;
         }
-
-        return card.getCarrierPrivilegeStatus(mApp.getPackageManager(), pkgName);
+        return getCarrierPrivilegeStatusFromCarrierConfigRules(
+            card.getCarrierPrivilegeStatus(mApp.getPackageManager(), pkgName),
+            getPhone(phoneId), pkgName);
     }
 
     @Override
@@ -4809,7 +4895,9 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
               continue;
             }
 
-            result = card.getCarrierPrivilegeStatus(mApp.getPackageManager(), pkgName);
+            result = getCarrierPrivilegeStatusFromCarrierConfigRules(
+                card.getCarrierPrivilegeStatus(mApp.getPackageManager(), pkgName),
+                getPhone(i), pkgName);
             if (result == TelephonyManager.CARRIER_PRIVILEGE_STATUS_HAS_ACCESS) {
                 break;
             }
@@ -4844,9 +4932,10 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
                 if (packages == null) {
                     // Only check packages in user 0 for now
                     packages = pm.getInstalledPackagesAsUser(
-                            PackageManager.MATCH_DISABLED_COMPONENTS
-                                    | PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS
-                                    | PackageManager.GET_SIGNATURES, UserHandle.USER_SYSTEM);
+                        PackageManager.MATCH_DISABLED_COMPONENTS
+                            | PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS
+                            | PackageManager.GET_SIGNING_CERTIFICATES,
+                            UserHandle.USER_SYSTEM);
                 }
                 for (int p = packages.size() - 1; p >= 0; p--) {
                     PackageInfo pkgInfo = packages.get(p);
@@ -5479,6 +5568,13 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
             // in and combined with those stale ones. In case this happens again,
             // user can reset all network settings which will clean up this table.
             cleanUpSmsRawTable(getDefaultPhone().getContext());
+
+            // Erase modem config if erase modem on network setting is enabled.
+            String configValue = DeviceConfig.getProperty(DeviceConfig.NAMESPACE_TELEPHONY,
+                    RESET_NETWORK_ERASE_MODEM_CONFIG_ENABLED);
+            if (configValue != null && Boolean.parseBoolean(configValue)) {
+              sendEraseModemConfig(getDefaultPhone());
+            }
         } finally {
             Binder.restoreCallingIdentity(identity);
         }
@@ -6459,7 +6555,10 @@ public class PhoneInterfaceManager extends ITelephony.Stub {
                 if (card != null) {
                     cardId = card.getCardId();
                 } else {
-                    cardId = slot.getIccId();
+                    cardId = slot.getEid();
+                    if (TextUtils.isEmpty(cardId)) {
+                        cardId = slot.getIccId();
+                    }
                 }
 
                 int cardState = 0;
